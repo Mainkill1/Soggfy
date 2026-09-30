@@ -1,25 +1,75 @@
 async function getPlatform(): Promise<any> {
+    let root: any = null;
+    let queue: any[] = [];
+    let seen = new Set<any>();
+    let walked = 0;
+
+    const own = (object: any, key: PropertyKey) => {
+        try {
+            let descriptor = Object.getOwnPropertyDescriptor(object, key);
+            return descriptor && "value" in descriptor ? descriptor.value : undefined;
+        } catch { return undefined; }
+    };
+    const isObject = (value: any) => value && typeof value === "object";
+    const method = (object: any, key: PropertyKey) => {
+        for (let depth = 0; isObject(object) && depth < 4; depth++, object = Object.getPrototypeOf(object)) {
+            let value = own(object, key);
+            if (typeof value === "function") return value;
+        }
+        return undefined;
+    };
+
     function tryGet() {
-        //Utils.findPath(document.querySelector("#main"), new Set(["getPlayerAPI"]), [], new Set()).join('?.')
+        let main = document.querySelector("#main") as any;
+        let key = main && Object.keys(main).find(k => k.startsWith("__reactContainer$"));
+        let current = key ? own(main, key) : null;
+        if (current !== root || !queue.length || walked >= 10000) {
+            root = current;
+            queue = current ? [current] : [];
+            seen = new Set();
+            walked = 0;
+        }
 
-        let mainDiv = document.querySelector("#main");
-        if (!mainDiv) return null;
+        while (queue.length && walked < 10000) {
+            let object = queue.pop();
+            if (!isObject(object) || seen.has(object)) continue;
+            seen.add(object);
+            walked++;
+            if (method(object, "getPlayerAPI")) return object;
+            let getState = method(object, "getState");
+            if (getState && method(object, "getEvents")) {
+                try {
+                    let state = getState.call(object);
+                    if (state && (state.item || state.playbackId !== undefined)) {
+                        let noOpSetting = { setValue() {} };
+                        return {
+                            getPlayerAPI: () => object,
+                            getUserAPI: () => ({ getUser: async () => ({ username: "" }) }),
+                            getSettingsAPI: () => ({ quality: {
+                                streamingQuality: noOpSetting,
+                                autoAdjustQuality: noOpSetting
+                            } }),
+                            getAdManagers: () => undefined,
+                            getClipboardAPI: () => ({ copy: (value: string) => navigator.clipboard?.writeText(value) })
+                        };
+                    }
+                } catch {}
+            }
 
-        let platform = mainDiv[Object.keys(mainDiv).find(k => k.startsWith("__reactContainer$"))]
-            ?.child?.child?.child?.child?.child?.child?.child?.child?.child?.child?.stateNode?.props?.children?.props?.children?.props?.platform;
-        /*
-        let reactRoot = (document.querySelector("#main") as any)?._reactRootContainer?._internalRoot;
-        if (!reactRoot) return null;
+            try {
+                let count = 0;
+                for (let value of Map.prototype.values.call(object)) {
+                    if (++count > 80 || queue.length >= 65536) break;
+                    if (isObject(value)) queue.push(value);
+                }
+            } catch {}
 
-        //1.1.90+
-        let platform = reactRoot.containerInfo[Object.keys(reactRoot.containerInfo).find(k => k.startsWith("__reactContainer$"))]
-            ?.child?.child?.stateNode?._reactInternals?.return?.return?.updateQueue?.baseState?.element?.props?.platform;
-
-        //1.1.7x+
-        platform ??= reactRoot.current?.child?.child?.stateNode?.props?.children?.props?.children?.props?.children?.props?.platform;
-        */
-
-        return platform;
+            for (let key of Object.keys(object).slice(0, 120)) {
+                let value = own(object, key);
+                if (isObject(value) && queue.length < 65536) queue.push(value);
+            }
+        }
+        return null;
     }
     function callback(resolve) {
         let apis = tryGet();
@@ -38,7 +88,7 @@ export const
     CosmosAsync = Player._cosmos,
     WebAPI = Platform?.getAdManagers()?.hpto?.hptoApi?.webApi; //TODO: this api reports telemetry, is it a good idea to use it?
 
-let user = await Platform.getUserAPI().getUser();
+let user = await Platform.getUserAPI().getUser().catch(() => ({ username: "" }));
 
 export class SpotifyUtils {
     /** Resets the current track (this method creates a new playback id) */

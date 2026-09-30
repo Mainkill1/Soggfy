@@ -5,12 +5,6 @@
   "dependencies": [
     "minhook",
     "nlohmann-json",
-    {
-      "name": "usockets",
-      "default-features": false,
-      "features": [ "network" ]
-    },
-    "uwebsockets",
-    "libogg"
+    "uwebsockets"
   ]
 }

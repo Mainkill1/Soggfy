@@ -2,14 +2,15 @@
 #include <fstream>
 #include <regex>
 #include <deque>
+#include <unordered_set>
 
 #include "StateManager.h"
+#include "OggCapture.h"
+#include "PlaybackMatcher.h"
 #include "ControlServer.h"
 #include "CefUtils.h"
 #include "Utils/Log.h"
 #include "Utils/Utils.h"
-
-#include <ogg/ogg.h>
 
 struct PlaybackInfo
 {
@@ -19,17 +20,17 @@ struct PlaybackInfo
     std::pair<std::string, std::string> Status; //(Status, Message)
     bool Discard = false;
     bool ReadyToSave = false;
-    bool ProbedFormat = false;
-
-    ogg_sync_state OggSync;
-    int64_t LastPageNo = -1;
 };
 //TODO: move most of playback state handling to TS
 struct StateManagerImpl : public StateManager
 {
     //TODO: fix potential race conditions with these (mutex is only locked when accessing this map)
     std::unordered_map<std::string, std::shared_ptr<PlaybackInfo>> _playbacks;
+    std::unordered_set<std::string> _ignoredPlaybacks;
     std::recursive_mutex _mutex;
+
+    OggStreamAssembler _oggAssembler;
+    PlaybackMatcher _playbackMatcher;
 
     json _config;
 
@@ -39,6 +40,8 @@ struct StateManagerImpl : public StateManager
     ControlServer _ctrlSv;
 
     StateManagerImpl(const fs::path& dataDir, const fs::path& moduleDir) :
+        _oggAssembler(128ull * 1024 * 1024),
+        _playbackMatcher(1.0, 16),
         _ctrlSv(std::bind(&StateManagerImpl::HandleMessage, this, std::placeholders::_1, std::placeholders::_2))
     {
         _dataDir = dataDir;
@@ -136,17 +139,22 @@ struct StateManagerImpl : public StateManager
             }
             case MessageType::DOWNLOAD_STATUS: {
                 if (content.contains("playbackId")) {
-                    auto playback = GetPlayback(content["playbackId"]);
-                    if (!playback) break;
+                    std::string playbackId = content["playbackId"];
+                    auto playback = GetPlayback(playbackId);
 
                     if (content.value("ignore", false)) {
-                        DiscardTrack(*playback, "Ignored");
+                        std::lock_guard lock(_mutex);
+                        _ignoredPlaybacks.insert(playbackId);
+                        _playbackMatcher.Cancel(playbackId);
+                        if (playback) DiscardTrack(*playback, "Ignored");
                     }
-                    conn->Send(MessageType::DOWNLOAD_STATUS, {
-                        { "playbackId", playback->Id },
-                        { "status", playback->Status.first },
-                        { "message", playback->Status.second }
-                    });
+                    if (playback) {
+                        conn->Send(MessageType::DOWNLOAD_STATUS, {
+                            { "playbackId", playback->Id },
+                            { "status", playback->Status.first },
+                            { "message", playback->Status.second }
+                        });
+                    }
                 }
                 else if (content.contains("searchTree")) {
                     json results = json::object();
@@ -164,15 +172,20 @@ struct StateManagerImpl : public StateManager
                 break;
             }
             case MessageType::PLAYER_STATE: {
-                if (content["event"] == "trackend") {
-                    auto playback = GetPlayback(content["playbackId"]);
-
-                    if (playback && !playback->ReadyToSave) {
-                        // When a track is skipped, the ReceiveData() hook will never get to see an EOS page.
-                        // Watch for track done events and remove them to avoid leaking memory.
-                        DiscardTrack(*playback, "Track was skipped");
-                        RemovePlayback(*playback);
+                const std::string event = content.value("event", "");
+                const std::string playbackId = content.value("playbackId", "");
+                if (event == "trackstart") {
+                    const double durationSeconds = content.value("durationMs", 0.0) / 1000.0;
+                    LogDebug("Cached playback event received (duration={:.3f}s)", durationSeconds);
+                    std::vector<MatchedOgg> matches;
+                    {
+                        std::lock_guard lock(_mutex);
+                        matches = _playbackMatcher.Announce({ playbackId, durationSeconds });
                     }
+                    PublishMatches(std::move(matches));
+                } else if (event == "trackend") {
+                    std::lock_guard lock(_mutex);
+                    _ignoredPlaybacks.erase(playbackId);
                 }
                 break;
             }
@@ -226,74 +239,56 @@ struct StateManagerImpl : public StateManager
         }
     }
 
-    void ReceiveAudioData(const std::string& playbackId, const char* data, int length)
+    void ReceiveOggPage(const OggPageView& page)
     {
-        auto playback = GetPlayback(playbackId, true);
-        if (!playback || playback->Discard) return;
-
-        auto& fs = playback->FileStream;
-
-        if (!fs.is_open()) {
-            LogWarn("Received audio data after EOS (this should never happen).");
-            DiscardTrack(*playback, "Stream truncated");
-            return;
-        }
-        if (!playback->ProbedFormat) {
-            playback->ProbedFormat = true;
-
-            if (memcmp(data, "OggS", 4) == 0) {
-                //skip spotify's custom ogg page which makes players to think the file is corrupt
-                auto nextPage = Utils::FindSubstr(data + 4, length - 4, "OggS", 4);
-
-                if (nextPage) {
-                    length -= nextPage - data;
-                    data = nextPage;
-                } else {
-                    //this might happen if the buffer is too small.
-                    LogWarn("Could not skip Spotify's custom OGG page. Downloaded file might be broken. (p#{})", playback->Id);
-                }
-                ogg_sync_init(&playback->OggSync);
-            } else {
-                LogWarn("Unrecognized audio codec in playback {}. Try changing streaming quality.", playbackId);
-                DiscardTrack(*playback, "Unrecognized audio codec");
-                return;
+        std::vector<MatchedOgg> matches;
+        {
+            std::lock_guard lock(_mutex);
+            OggCaptureEvent event = OggCaptureEvent::None;
+            auto completed = _oggAssembler.Push(page, &event);
+            switch (event) {
+                case OggCaptureEvent::Started:
+                    LogDebug("Vorbis beginning-of-stream page captured");
+                    break;
+                case OggCaptureEvent::SequenceMismatch:
+                    LogWarn("Discarded Ogg stream after a page-sequence gap");
+                    break;
+                case OggCaptureEvent::SizeLimit:
+                    LogWarn("Discarded Ogg stream after exceeding the in-memory size limit");
+                    break;
+                default:
+                    break;
+            }
+            if (completed) {
+                LogDebug("Completed Ogg stream in memory (duration={:.3f}s, bytes={})",
+                    completed->DurationSeconds, completed->Bytes.size());
+                matches = _playbackMatcher.Complete(std::move(*completed));
             }
         }
+        PublishMatches(std::move(matches));
+    }
 
-        ogg_sync_state* oy = &playback->OggSync;
-        ogg_page page;
-
-        char* buffer = ogg_sync_buffer(oy, length);
-        memcpy(buffer, data, length);
-        ogg_sync_wrote(oy, length);
-
-        while (ogg_sync_pageout(oy, &page) == 1) {
-            LogTrace("RecvOggPage no={} granule={:.1f}s bos={} eos={} pb={}",
-                     ogg_page_pageno(&page), ogg_page_granulepos(&page) / 44100.0,
-                     ogg_page_bos(&page), ogg_page_eos(&page), std::string_view(playback->Id.data(), 6));
-
-            int64_t pageNo = ogg_page_pageno(&page);
-
-            if ((fs.tellp() == 0) && !ogg_page_bos(&page)) {
-                DiscardTrack(*playback, "Track didn't play from start");
-                return;
+    void PublishMatches(std::vector<MatchedOgg> matches)
+    {
+        for (auto& match : matches) {
+            std::shared_ptr<PlaybackInfo> playback;
+            {
+                std::lock_guard lock(_mutex);
+                if (_ignoredPlaybacks.erase(match.PlaybackId)) continue;
+                playback = GetPlayback(match.PlaybackId, true);
             }
-            if (pageNo != playback->LastPageNo + 1) {
-                DiscardTrack(*playback, "Track was seeked");
-                return;
+            if (!playback || playback->Discard) continue;
+
+            playback->FileStream.write(reinterpret_cast<const char*>(match.Bytes.data()), match.Bytes.size());
+            if (!playback->FileStream.good()) {
+                DiscardTrack(*playback, "Could not write completed Ogg stream");
+                RemovePlayback(*playback);
+                continue;
             }
-            playback->LastPageNo = pageNo;
-
-            fs.write((char*)page.header, page.header_len);
-            fs.write((char*)page.body, page.body_len);
-
-            if (ogg_page_eos(&page)) {
-                playback->ReadyToSave = true;
-                fs.close();
-
-                LogDebug("Requesting metadata for playback {}...", playbackId);
-                _ctrlSv.Broadcast(MessageType::TRACK_META, { { "playbackId", playbackId } });
-            }
+            playback->ReadyToSave = true;
+            playback->FileStream.close();
+            LogDebug("Requesting metadata for playback {}...", match.PlaybackId);
+            _ctrlSv.Broadcast(MessageType::TRACK_META, { { "playbackId", match.PlaybackId } });
         }
     }
 
@@ -312,7 +307,6 @@ struct StateManagerImpl : public StateManager
             std::error_code err;
             fs::remove(playback.FileName, err);
 
-            ogg_sync_clear(&playback.OggSync);
         }
     }
 
@@ -374,8 +368,14 @@ struct StateManagerImpl : public StateManager
 
     void Shutdown()
     {
-        for (auto& [id, playback] : _playbacks) {
-            playback->FileStream.close();
+        {
+            std::lock_guard lock(_mutex);
+            _oggAssembler.Clear();
+            _playbackMatcher.Clear();
+            _ignoredPlaybacks.clear();
+            for (auto& [id, playback] : _playbacks) {
+                playback->FileStream.close();
+            }
         }
         _ctrlSv.Stop();
     }

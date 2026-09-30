@@ -22,8 +22,12 @@ export default class PlayerStateTracker {
             if (!data.playbackId) return;
 
             if (!this.playbacks.has(data.playbackId)) {
+                conn.send(MessageType.PLAYER_STATE, {
+                    event: "trackstart",
+                    playbackId: data.playbackId,
+                    durationMs: Number(data.item?.metadata?.duration || 0)
+                });
                 conn.send(MessageType.DOWNLOAD_STATUS, { playbackId: data.playbackId, ignore: isTrackIgnored(data.item) });
-                conn.send(MessageType.PLAYER_STATE, { event: "trackstart", playbackId: data.playbackId });
             }
             this.playbacks.set(data.playbackId, data);
         });
@@ -82,40 +86,8 @@ export default class PlayerStateTracker {
             coverPath: paths.cover,
             coverTempPath: track.metadata.image_xlarge_url.replaceAll(":", "_")
         };
-        let coverData = await Resources.getImageData(track.metadata.image_xlarge_url);
-
-        if (config.saveLyrics || config.embedLyrics) {
-            let lyrics = await this.getLyrics(track);
-
-            if (lyrics && config.embedLyrics) {
-                let text = lyrics.text;
-                //workaround for the 32k command line limit
-                //TODO: the proper solution is to use that FFMETADATA file with the lyrics
-                if (text.length > 25000) {
-                    text = text.substring(0, 25000);
-                }
-                data.metadata.lyrics = text;
-            }
-            if (lyrics && config.saveLyrics) {
-                let ext = lyrics.isSynced ? "lrc" : "txt";
-                this.conn.send(MessageType.WRITE_FILE, {
-                    path: PathTemplate.replaceExt(data.trackPath, ext),
-                    text: lyrics.text,
-                    mode: "keep"
-                });
-            }
-        }
-        let canvasUrl = track.metadata["canvas.url"];
-        if (config.saveCanvas && canvasUrl) {
-            try {
-                let canvasData = await Resources.fetchBytes(canvasUrl);
-                this.conn.send(MessageType.WRITE_FILE, { path: paths.canvas, mode: "keep" }, canvasData);
-            } catch (ex) {
-                console.error("Failed to fetch canvas for %s: %s", track.uri, ex);
-            }
-        }
         this.fixMetadata(track, data.metadata, config.outputFormat.ext || "ogg");
-        return { info: data, coverData: coverData };
+        return { info: data, coverData: new ArrayBuffer(0) };
     }
     private getSavePaths(type: string, meta: any, playback: PlayerState) {
         let template = config.savePaths[type] as string;
@@ -161,43 +133,37 @@ export default class PlayerStateTracker {
     }
     private async getTrackMetaProps(track: TrackInfo) {
         let meta = track.metadata;
-        let extraMeta = await Resources.getTrackMetadataWG(track.uri);
-
-        let { year, month, day } = extraMeta.album.date;
-        let date = [year, month, day];
-        //Truncate date to available precision
-        if (!day) date.pop();
-        if (!month) date.pop();
+        let date = meta["release_date"] || meta["album_release_date"] || meta["year"];
         
         return {
             title:          meta.title,
             album_artist:   meta.artist_name,
             album:          meta.album_title,
-            artist:         extraMeta.artist.map(v => v.name).join("/"),
+            artist:         meta.artist_name,
             track:          meta.album_track_number,
             totaltracks:    meta.album_track_count,
             disc:           meta.album_disc_number,
             totaldiscs:     meta.album_disc_count,
-            date:           date.map(x => Utils.padInt(x, 2)).join('-'), //YYYY-MM-DD,
-            publisher:      extraMeta.album.label,
-            language:       extraMeta.language_of_performance?.[0],
-            isrc:           extraMeta.external_id?.find(v => v.type === "isrc")?.id,
+            date:           date,
+            publisher:      meta["label"],
+            language:       meta["language"],
+            isrc:           meta["isrc"],
             comment:        Resources.getOpenTrackURL(track.uri),
             explicit:       meta.is_explicit ? "1" : undefined
         };
     }
     private async getPodcastMetaProps(track: TrackInfo) {
-        let meta = await Resources.getEpisodeMetadata(track.uri);
+        let meta: any = track.metadata;
 
         return {
-            title:          meta.name,
-            album:          meta.show.name,
-            album_artist:   meta.show.publisher,
+            title:          meta.title || meta.name,
+            album:          meta.album_title || meta.show_name,
+            album_artist:   meta.artist_name || meta.publisher,
             description:    meta.description,
-            podcastdesc:    meta.show.description,
-            podcasturl:     meta.external_urls.spotify,
-            publisher:      meta.show.publisher,
-            date:           meta.release_date,
+            podcastdesc:    meta.show_description,
+            podcasturl:     meta.external_url,
+            publisher:      meta.publisher || meta.artist_name,
+            date:           meta.release_date || meta.year,
             language:       meta.language,
             comment:        Resources.getOpenTrackURL(track.uri),
             podcast:        "1",
