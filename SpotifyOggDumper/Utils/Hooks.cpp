@@ -115,7 +115,10 @@ namespace Hooks
 
     void CreateApi(const wchar_t* modName, const char* funcName, FuncAddr detour, FuncAddr* orig)
     {
-        MH_Check(MH_CreateHookApi(modName, funcName, detour, orig), funcName);
+        auto module = GetModuleHandleW(modName);
+        auto target = module ? GetProcAddress(module, funcName) : nullptr;
+        if (!target) MH_Check(MH_ERROR_FUNCTION_NOT_FOUND, funcName);
+        Create(reinterpret_cast<FuncAddr>(target), detour, orig, funcName);
     }
 
     void CreatePattern(

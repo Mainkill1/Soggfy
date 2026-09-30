@@ -1,5 +1,6 @@
 import config from "./config";
 import { PlayerState } from "./spotify-apis";
+import { getReleaseYear } from "./metadata-values";
 
 interface PathVar {
     name: string;
@@ -54,7 +55,7 @@ export class PathTemplate {
             name: "release_year",
             desc: "Release year",
             pattern: `\\d+`,
-            getValue: m => m.date.split('-')[0]
+            getValue: m => getReleaseYear(m.date)
         },
         {
             name: "release_date",
