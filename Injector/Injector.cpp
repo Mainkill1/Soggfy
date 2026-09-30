@@ -1,5 +1,6 @@
 #include <iostream>
 #include <filesystem>
+#include <format>
 #include <functional>
 #include <unordered_set>
 
@@ -8,37 +9,125 @@
 #include <TlHelp32.h>
 #include <psapi.h>
 #include <shlobj_core.h>
+#include "InjectorCore.h"
 
 namespace fs = std::filesystem;
 
-void InjectDll(HANDLE hProc, const fs::path& dllPath)
+bool ReadRemote(HANDLE process, uintptr_t address, void* output, SIZE_T size)
+{
+    SIZE_T bytesRead = 0;
+    return ReadProcessMemory(process, reinterpret_cast<const void*>(address), output, size, &bytesRead) &&
+        bytesRead == size;
+}
+
+uintptr_t FindRemoteModuleFromPeb(HANDLE process, const wchar_t* moduleName)
+{
+    using QueryProcess = NTSTATUS(NTAPI*)(HANDLE, PROCESSINFOCLASS, PVOID, ULONG, PULONG);
+    auto queryProcess = reinterpret_cast<QueryProcess>(GetProcAddress(
+        GetModuleHandleW(L"ntdll.dll"), "NtQueryInformationProcess"));
+    PROCESS_BASIC_INFORMATION processInfo{};
+    if (!queryProcess || !NT_SUCCESS(queryProcess(process, ProcessBasicInformation,
+        &processInfo, sizeof(processInfo), nullptr))) return 0;
+
+    struct PebPrefix { uint8_t Reserved[0x18]; uintptr_t Loader; } peb{};
+    struct LoaderPrefix { uint8_t Reserved[0x10]; LIST_ENTRY Modules; } loader{};
+    struct LoaderEntry {
+        LIST_ENTRY LoadOrder;
+        LIST_ENTRY MemoryOrder;
+        LIST_ENTRY InitializationOrder;
+        uintptr_t ModuleBase;
+        uintptr_t EntryPoint;
+        ULONG ImageSize;
+        ULONG Padding;
+        UNICODE_STRING FullName;
+        UNICODE_STRING BaseName;
+    } entry{};
+
+    if (!ReadRemote(process, reinterpret_cast<uintptr_t>(processInfo.PebBaseAddress), &peb, sizeof(peb)) ||
+        !peb.Loader || !ReadRemote(process, peb.Loader, &loader, sizeof(loader))) return 0;
+
+    const uintptr_t listHead = peb.Loader + offsetof(LoaderPrefix, Modules);
+    uintptr_t current = reinterpret_cast<uintptr_t>(loader.Modules.Flink);
+    for (size_t count = 0; current && current != listHead && count < 128; ++count) {
+        if (!ReadRemote(process, current, &entry, sizeof(entry))) return 0;
+        if (entry.BaseName.Buffer && entry.BaseName.Length && entry.BaseName.Length < 1024) {
+            std::wstring name(entry.BaseName.Length / sizeof(wchar_t), L'\0');
+            if (ReadRemote(process, reinterpret_cast<uintptr_t>(entry.BaseName.Buffer),
+                name.data(), entry.BaseName.Length) && _wcsicmp(name.c_str(), moduleName) == 0) {
+                return entry.ModuleBase;
+            }
+        }
+        current = reinterpret_cast<uintptr_t>(entry.LoadOrder.Flink);
+    }
+    return 0;
+}
+
+uintptr_t FindRemoteModule(HANDLE process, DWORD processId, const wchar_t* moduleName)
+{
+    HANDLE snapshot = CreateToolhelp32Snapshot(TH32CS_SNAPMODULE | TH32CS_SNAPMODULE32, processId);
+    if (snapshot != INVALID_HANDLE_VALUE) {
+        MODULEENTRY32W module = {};
+        module.dwSize = sizeof(module);
+        if (Module32FirstW(snapshot, &module)) {
+            do {
+                if (_wcsicmp(module.szModule, moduleName) == 0) {
+                    const auto result = reinterpret_cast<uintptr_t>(module.modBaseAddr);
+                    CloseHandle(snapshot);
+                    return result;
+                }
+            } while (Module32NextW(snapshot, &module));
+        }
+        CloseHandle(snapshot);
+    }
+
+    if (auto result = FindRemoteModuleFromPeb(process, moduleName)) return result;
+    throw std::runtime_error("kernel32.dll was not available in the target process");
+}
+
+void InjectDll(HANDLE hProc, DWORD processId, const fs::path& dllPath)
 {
     fs::path path = fs::absolute(dllPath);
+    if (!fs::exists(path)) throw std::runtime_error("SpotifyOggDumper.dll was not found beside the injector");
     std::wstring pathW = path.wstring();
-    DWORD pathLenBytes = (pathW.size() + 1) * 2;
-    
-    HANDLE loadLibAddr = GetProcAddress(GetModuleHandle(L"Kernel32.dll"), "LoadLibraryW");
+    SIZE_T pathLenBytes = (pathW.size() + 1) * sizeof(wchar_t);
+
+    auto localKernel32 = reinterpret_cast<uintptr_t>(GetModuleHandleW(L"kernel32.dll"));
+    auto localLoadLibrary = reinterpret_cast<uintptr_t>(GetProcAddress(
+        reinterpret_cast<HMODULE>(localKernel32), "LoadLibraryW"));
+    auto remoteKernel32 = FindRemoteModule(hProc, processId, L"kernel32.dll");
+    auto remoteLoadLibrary = RebaseRemoteExport(localKernel32, localLoadLibrary, remoteKernel32);
+    if (!remoteLoadLibrary) throw std::runtime_error("Could not resolve remote LoadLibraryW");
+
     LPVOID pathArgAddr = VirtualAllocEx(hProc, NULL, pathLenBytes, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
     if (!pathArgAddr) {
-        throw std::exception("Could not allocate memory on target process");
+        throw std::runtime_error("Could not allocate memory in the target process");
     }
-    WriteProcessMemory(hProc, pathArgAddr, pathW.data(), pathLenBytes, NULL);
+    HANDLE thread = nullptr;
+    try {
+        SIZE_T bytesWritten = 0;
+        if (!WriteProcessMemory(hProc, pathArgAddr, pathW.c_str(), pathLenBytes, &bytesWritten) ||
+            bytesWritten != pathLenBytes) {
+            throw std::runtime_error("Could not write the DLL path to the target process");
+        }
 
-    HANDLE thread = CreateRemoteThread(hProc, NULL, 0, (LPTHREAD_START_ROUTINE)loadLibAddr, pathArgAddr, 0, NULL);
-    if (!thread) {
-        throw std::exception("Could not create remote thread");
+        thread = CreateRemoteThread(hProc, NULL, 0,
+            reinterpret_cast<LPTHREAD_START_ROUTINE>(remoteLoadLibrary), pathArgAddr, 0, NULL);
+        if (!thread) throw std::runtime_error("Could not create the remote loader thread");
+
+        DWORD waitResult = WaitForSingleObject(thread, 10000);
+        if (waitResult == WAIT_TIMEOUT) throw std::runtime_error("Remote loader thread timed out");
+        if (waitResult != WAIT_OBJECT_0) throw std::runtime_error("Could not wait for the remote loader thread");
+
+        DWORD exitCode = 0;
+        if (!GetExitCodeThread(thread, &exitCode) || exitCode == 0)
+            throw std::runtime_error("Spotify rejected SpotifyOggDumper.dll");
+    } catch (...) {
+        if (thread) CloseHandle(thread);
+        VirtualFreeEx(hProc, pathArgAddr, 0, MEM_RELEASE);
+        throw;
     }
-    if (WaitForSingleObject(thread, 10000) == WAIT_FAILED) {
-        throw std::exception("Thread exit timeout");
-    }
-    DWORD exitCode;
-    GetExitCodeThread(thread, &exitCode);
-    if (exitCode == 0) {
-        throw std::exception("Failed to load library from remote process");
-    }
-    //FIXME: we should probably free these handles before throwing exceptions
-    VirtualFreeEx(hProc, pathArgAddr, 0, MEM_RELEASE);
     CloseHandle(thread);
+    VirtualFreeEx(hProc, pathArgAddr, 0, MEM_RELEASE);
 }
 
 void EnumProcessesEx(std::function<void(PROCESSENTRY32&)> visitor)
@@ -123,7 +212,16 @@ HANDLE FindSpotifyProcess()
         false, procId
     );
 }
-HANDLE LaunchSpotifyProcess(bool enableRemoteDebug)
+struct ProcessTarget
+{
+    HANDLE Process = INVALID_HANDLE_VALUE;
+    HANDLE MainThread = nullptr;
+    DWORD ProcessId = 0;
+    bool LaunchedByInjector = false;
+    bool MainThreadSuspended = false;
+};
+
+ProcessTarget LaunchSpotifyProcess(bool enableRemoteDebug)
 {
     fs::path exePath = fs::absolute("Spotify/Spotify.exe");
     if (!fs::exists(exePath)) {
@@ -146,19 +244,88 @@ HANDLE LaunchSpotifyProcess(bool enableRemoteDebug)
         cmdLine += L" --remote-debugging-port=9222";
     }
 
-    if (!CreateProcess(exePath.c_str(), cmdLine.data(), NULL, NULL, false, 0, NULL, workDir.c_str(), &startInfo, &proc)) {
-        throw std::exception("Could not start Spotify process");
+    if (!CreateProcess(exePath.c_str(), cmdLine.data(), NULL, NULL, false, DEBUG_ONLY_THIS_PROCESS,
+        NULL, workDir.c_str(), &startInfo, &proc)) {
+        throw std::runtime_error("Could not start Spotify process");
     }
-    //Wait a bit until the window is open
-    for (int i = 0; !HasOpenWindow(proc.dwProcessId); i++) {
-        if (i >= 30) { //15s
-            std::cout << COL_YELLOW << "Spotify is taking too long to open. Try re-injecting if Soggfy doesn't load properly.\n" COL_RESET;
-            break;
+
+    uintptr_t applicationEntry = 0;
+    uint8_t entryByte = 0;
+    bool entryBreakpointInstalled = false;
+    bool stoppedAtEntry = false;
+    DEBUG_EVENT event{};
+    while (WaitForDebugEvent(&event, 10000)) {
+        if (event.dwDebugEventCode == CREATE_PROCESS_DEBUG_EVENT) {
+            if (event.u.CreateProcessInfo.hFile) CloseHandle(event.u.CreateProcessInfo.hFile);
+            auto imageBase = reinterpret_cast<uintptr_t>(event.u.CreateProcessInfo.lpBaseOfImage);
+            IMAGE_DOS_HEADER dos{};
+            IMAGE_NT_HEADERS64 nt{};
+            if (ReadRemote(proc.hProcess, imageBase, &dos, sizeof(dos)) &&
+                dos.e_magic == IMAGE_DOS_SIGNATURE && dos.e_lfanew > 0 &&
+                ReadRemote(proc.hProcess, imageBase + dos.e_lfanew, &nt, sizeof(nt)) &&
+                nt.Signature == IMAGE_NT_SIGNATURE) {
+                applicationEntry = imageBase + nt.OptionalHeader.AddressOfEntryPoint;
+            }
         }
-        Sleep(500);
+        if (event.dwDebugEventCode == LOAD_DLL_DEBUG_EVENT && event.u.LoadDll.hFile)
+            CloseHandle(event.u.LoadDll.hFile);
+
+        if (event.dwDebugEventCode == EXCEPTION_DEBUG_EVENT &&
+            event.u.Exception.ExceptionRecord.ExceptionCode == EXCEPTION_BREAKPOINT) {
+            const auto exceptionAddress = reinterpret_cast<uintptr_t>(
+                event.u.Exception.ExceptionRecord.ExceptionAddress);
+            if (!entryBreakpointInstalled) {
+                uint8_t breakpoint = 0xcc;
+                SIZE_T transferred = 0;
+                if (!applicationEntry ||
+                    !ReadRemote(proc.hProcess, applicationEntry, &entryByte, sizeof(entryByte)) ||
+                    !WriteProcessMemory(proc.hProcess, reinterpret_cast<void*>(applicationEntry),
+                        &breakpoint, sizeof(breakpoint), &transferred) || transferred != sizeof(breakpoint)) {
+                    ContinueDebugEvent(event.dwProcessId, event.dwThreadId, DBG_CONTINUE);
+                    break;
+                }
+                FlushInstructionCache(proc.hProcess, reinterpret_cast<void*>(applicationEntry), 1);
+                entryBreakpointInstalled = true;
+            } else if (exceptionAddress == applicationEntry) {
+                SIZE_T transferred = 0;
+                WriteProcessMemory(proc.hProcess, reinterpret_cast<void*>(applicationEntry),
+                    &entryByte, sizeof(entryByte), &transferred);
+                FlushInstructionCache(proc.hProcess, reinterpret_cast<void*>(applicationEntry), 1);
+
+                CONTEXT context{};
+                context.ContextFlags = CONTEXT_CONTROL;
+                if (transferred != sizeof(entryByte) || !GetThreadContext(proc.hThread, &context) ||
+                    SuspendThread(proc.hThread) == DWORD(-1)) {
+                    ContinueDebugEvent(event.dwProcessId, event.dwThreadId, DBG_CONTINUE);
+                    break;
+                }
+                context.Rip = applicationEntry;
+                if (!SetThreadContext(proc.hThread, &context)) {
+                    ResumeThread(proc.hThread);
+                    ContinueDebugEvent(event.dwProcessId, event.dwThreadId, DBG_CONTINUE);
+                    break;
+                }
+                stoppedAtEntry = true;
+            }
+        }
+
+        const bool breakpointEvent = event.dwDebugEventCode == EXCEPTION_DEBUG_EVENT &&
+            event.u.Exception.ExceptionRecord.ExceptionCode == EXCEPTION_BREAKPOINT;
+        const DWORD continueStatus = event.dwDebugEventCode == EXCEPTION_DEBUG_EVENT && !breakpointEvent
+            ? DBG_EXCEPTION_NOT_HANDLED : DBG_CONTINUE;
+        ContinueDebugEvent(event.dwProcessId, event.dwThreadId,
+            stoppedAtEntry ? DBG_CONTINUE : continueStatus);
+        if (stoppedAtEntry) break;
+        if (event.dwDebugEventCode == EXIT_PROCESS_DEBUG_EVENT) break;
     }
-    CloseHandle(proc.hThread);
-    return proc.hProcess;
+
+    if (!stoppedAtEntry || !DebugActiveProcessStop(proc.dwProcessId)) {
+        TerminateProcess(proc.hProcess, 1);
+        CloseHandle(proc.hThread);
+        CloseHandle(proc.hProcess);
+        throw std::runtime_error("Could not stop Spotify before its application entry point");
+    }
+    return { proc.hProcess, proc.hThread, proc.dwProcessId, true, true };
 }
 
 void KillSpotifyProcesses()
@@ -195,31 +362,62 @@ void EnableAnsiColoring()
     SetConsoleMode(handle, currMode | ENABLE_VIRTUAL_TERMINAL_PROCESSING);
 }
 
+HANDLE CreateInitializationEvent(DWORD processId)
+{
+    const auto name = std::format(L"Local\\SoggfyInitReady-{}", processId);
+    return CreateEventW(nullptr, TRUE, FALSE, name.c_str());
+}
+
 int main(int argc, char* argv[])
 {
-    bool launch = false;
-    bool enableRemoteDebug = false;
-    for (int i = 0; i < argc; i++) {
-        launch |= strcmp(argv[i], "-l") == 0;
-        enableRemoteDebug |= strcmp(argv[i], "-d") == 0;
-    }
-    
+    auto options = ParseInjectorOptions(argc, argv);
     EnableAnsiColoring();
 
+    ProcessTarget target;
     try {
-        HANDLE targetProc = FindSpotifyProcess();
-        if (launch || targetProc == INVALID_HANDLE_VALUE) {
+        HANDLE existingProcess = FindSpotifyProcess();
+        if (options.ForceLaunch || existingProcess == INVALID_HANDLE_VALUE) {
             KillSpotifyProcesses();
             DeleteSpotifyUpdate();
-            targetProc = LaunchSpotifyProcess(enableRemoteDebug);
+            target = LaunchSpotifyProcess(options.EnableRemoteDebug);
+        } else {
+            target.Process = existingProcess;
+            target.ProcessId = GetProcessId(existingProcess);
+            std::cout << COL_YELLOW
+                << "Attaching to an already running Spotify process. Use -l for early browser integration.\n"
+                << COL_RESET;
         }
-        std::cout << "Injecting dumper dll into Spotify process (" << GetProcessId(targetProc) << ")...\n";
+        std::cout << "Injecting dumper dll into Spotify process (" << target.ProcessId << ")...\n";
 
-        InjectDll(targetProc, L"SpotifyOggDumper.dll");
-        CloseHandle(targetProc);
+        HANDLE initializationEvent = target.MainThreadSuspended
+            ? CreateInitializationEvent(target.ProcessId) : nullptr;
+        try {
+            InjectDll(target.Process, target.ProcessId, L"SpotifyOggDumper.dll");
+        } catch (...) {
+            if (initializationEvent) CloseHandle(initializationEvent);
+            throw;
+        }
+        if (target.MainThreadSuspended) {
+            if (initializationEvent) {
+                WaitForSingleObject(initializationEvent, 3000);
+                CloseHandle(initializationEvent);
+            }
+            if (ResumeThread(target.MainThread) == DWORD(-1))
+                throw std::runtime_error("Could not start Spotify after injection");
+            target.MainThreadSuspended = false;
+        }
+        if (target.MainThread) CloseHandle(target.MainThread);
+        CloseHandle(target.Process);
+        target = {};
         
         std::cout << COL_GREEN "Injection succeeded!\n" COL_RESET;
     } catch (std::exception& ex) {
+        if (target.LaunchedByInjector && target.Process != INVALID_HANDLE_VALUE) {
+            TerminateProcess(target.Process, 1);
+            WaitForSingleObject(target.Process, 3000);
+        }
+        if (target.MainThread) CloseHandle(target.MainThread);
+        if (target.Process != INVALID_HANDLE_VALUE) CloseHandle(target.Process);
         std::cout << COL_RED "Error: " << ex.what() << "\n" COL_RESET;
     }
     
