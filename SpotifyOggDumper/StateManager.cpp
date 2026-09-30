@@ -4,6 +4,7 @@
 #include <deque>
 
 #include "StateManager.h"
+#include "OggPageFilter.h"
 #include "ControlServer.h"
 #include "CefUtils.h"
 #include "Utils/Log.h"
@@ -242,16 +243,6 @@ struct StateManagerImpl : public StateManager
             playback->ProbedFormat = true;
 
             if (memcmp(data, "OggS", 4) == 0) {
-                //skip spotify's custom ogg page which makes players to think the file is corrupt
-                auto nextPage = Utils::FindSubstr(data + 4, length - 4, "OggS", 4);
-
-                if (nextPage) {
-                    length -= nextPage - data;
-                    data = nextPage;
-                } else {
-                    //this might happen if the buffer is too small.
-                    LogWarn("Could not skip Spotify's custom OGG page. Downloaded file might be broken. (p#{})", playback->Id);
-                }
                 ogg_sync_init(&playback->OggSync);
             } else {
                 LogWarn("Unrecognized audio codec in playback {}. Try changing streaming quality.", playbackId);
@@ -274,9 +265,16 @@ struct StateManagerImpl : public StateManager
 
             int64_t pageNo = ogg_page_pageno(&page);
 
-            if ((fs.tellp() == 0) && !ogg_page_bos(&page)) {
-                DiscardTrack(*playback, "Track didn't play from start");
-                return;
+            if (fs.tellp() == 0) {
+                if (!IsVorbisIdentificationPage(
+                        ogg_page_bos(&page),
+                        reinterpret_cast<const uint8_t*>(page.body),
+                        page.body_len)) {
+                    // Older streams may begin with a Spotify-specific Ogg page.
+                    // Ignore it, but keep a real Vorbis BOS page when it arrives first.
+                    continue;
+                }
+                playback->LastPageNo = pageNo - 1;
             }
             if (pageNo != playback->LastPageNo + 1) {
                 DiscardTrack(*playback, "Track was seeked");
